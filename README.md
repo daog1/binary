@@ -1,5 +1,7 @@
 # binary
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/daog1/binary)
+
 
 ### Borsh
 
