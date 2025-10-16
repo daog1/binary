@@ -38,6 +38,11 @@ func (e *Encoder) encodeBin(rv reflect.Value, opt *option) (err error) {
 		)
 	}
 
+	// Handle nested tags first
+	if opt.FieldTag != nil && opt.FieldTag.NestedTag != nil {
+		return e.encodeWithTagTree(rv, opt.FieldTag.NestedTag)
+	}
+
 	if opt.is_Optional() {
 		if rv.IsZero() {
 			if traceEnabled {
@@ -239,6 +244,7 @@ func (e *Encoder) encodeStructBin(rt reflect.Type, rv reflect.Value) (err error)
 		option := &option{
 			is_OptionalField: fieldTag.Option,
 			Order:            fieldTag.Order,
+			FieldTag:         fieldTag,
 		}
 
 		if s, ok := sizeOfMap[structField.Name]; ok {

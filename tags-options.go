@@ -24,6 +24,7 @@ type option struct {
 	is_COptionalField bool
 	SizeOfSlice       *int
 	Order             binary.ByteOrder
+	FieldTag          *fieldTag
 }
 
 var (

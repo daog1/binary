@@ -99,6 +99,183 @@ func (e *Encoder) Written() int {
 	return e.count
 }
 
+// encodeWithTagTree 根据标签树进行编码
+func (e *Encoder) encodeWithTagTree(rv reflect.Value, tagTree *TagNode) error {
+	if tagTree == nil {
+		return e.Encode(rv.Interface())
+	}
+
+	switch tagTree.Name {
+	case "hidden_prefix":
+		if len(tagTree.Children) < 1 || len(tagTree.Children) > 2 {
+			return fmt.Errorf("hidden_prefix expects 1 or 2 children, got %d", len(tagTree.Children))
+		}
+		constant := tagTree.FindChildByName("constant")
+		e.encodeWithTagTree(rv, constant)
+		fixed_size := tagTree.FindChildByName("fixed_size")
+		if fixed_size != nil {
+			return e.encodeWithTagTree(rv, fixed_size)
+		}
+		return e.Encode(rv.Addr().Interface())
+
+	case "remainder_option":
+		// remainder_option<> - optional field that consumes remaining data
+		if rv.IsNil() {
+			return nil // Don't encode anything
+		}
+		return e.Encode(rv.Interface())
+
+	case "pre_offset":
+		// pre_offset<> - pre-offset encoding (simplified implementation)
+		return e.Encode(rv.Interface())
+
+	case "constant":
+		// constant<type,value> or constant<value> (defaults to u8)
+		if len(tagTree.Children) == 1 {
+			// Single value, default to u8
+			constValue := tagTree.Children[0].Value.(int)
+			return e.writeConstant("u8", constValue)
+		} else if len(tagTree.Children) == 2 {
+			constType := tagTree.Children[0].Value.(string)
+			constValue := tagTree.Children[1].Value.(int)
+			return e.writeConstant(constType, constValue)
+		}
+		return fmt.Errorf("invalid constant children")
+
+	case "fixed_size":
+		// fixed_size<size> or fixed_size<type,size> - fixed size encoding
+		var size int
+		if len(tagTree.Children) == 1 {
+			size = tagTree.Children[0].Value.(int)
+		} else if len(tagTree.Children) == 2 {
+			size = tagTree.Children[1].Value.(int)
+		} else {
+			return fmt.Errorf("fixed_size expects 1 or 2 children, got %d", len(tagTree.Children))
+		}
+		if rv.Kind() != reflect.String {
+			return fmt.Errorf("fixed_size currently only supports string, got %v", rv.Kind())
+		}
+		str := rv.String()
+		strBytes := []byte(str)
+		// 截断或填充到指定大小
+		if len(strBytes) > size {
+			strBytes = strBytes[:size]
+		} else if len(strBytes) < size {
+			padding := make([]byte, size-len(strBytes))
+			strBytes = append(strBytes, padding...)
+		}
+		return e.toWriter(strBytes)
+
+	case "size_prefix":
+		// size_prefix<prefix_type> - encode size using the specified prefix type
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("size_prefix expects 1 child, got %d", len(tagTree.Children))
+		}
+		if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+			return fmt.Errorf("size_prefix only supports slice or array, got %v", rv.Kind())
+		}
+		l := rv.Len()
+		// Encode length using the prefix type
+		if err := e.encodeWithTagTree(reflect.ValueOf(l), tagTree.Children[0]); err != nil {
+			return fmt.Errorf("failed to encode size prefix: %w", err)
+		}
+		// Encode elements
+		for i := 0; i < l; i++ {
+			if err := e.Encode(rv.Index(i).Interface()); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case "fixed":
+		// fixed<...> - container for fixed encoding
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("fixed expects 1 child, got %d", len(tagTree.Children))
+		}
+		return e.encodeWithTagTree(rv, tagTree.Children[0])
+
+	case "option":
+		// option<subtag> - encode as variant: 0 if zero, 1 + encode(value) otherwise
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("option expects 1 child, got %d", len(tagTree.Children))
+		}
+		isZero := rv.IsZero()
+		if isZero {
+			return e.WriteByte(0)
+		} else {
+			err := e.WriteByte(1)
+			if err != nil {
+				return err
+			}
+			return e.encodeWithTagTree(rv, tagTree.Children[0])
+		}
+
+	case "prefix":
+		// prefix<type,order> - encode value using specified type and byte order
+		if len(tagTree.Children) != 2 {
+			return fmt.Errorf("prefix expects 2 children, got %d", len(tagTree.Children))
+		}
+		typeName := tagTree.Children[0].Value.(string)
+		orderName := tagTree.Children[1].Value.(string)
+		var order binary.ByteOrder
+		if orderName == "le" {
+			order = binary.LittleEndian
+		} else if orderName == "be" {
+			order = binary.BigEndian
+		} else {
+			return fmt.Errorf("unknown byte order: %s", orderName)
+		}
+		// Get the value as uint64
+		var val uint64
+		if rv.Kind() == reflect.Int || rv.Kind() == reflect.Int8 || rv.Kind() == reflect.Int16 || rv.Kind() == reflect.Int32 || rv.Kind() == reflect.Int64 {
+			val = uint64(rv.Int())
+		} else {
+			val = rv.Uint()
+		}
+		// Encode val as the specified type
+		switch typeName {
+		case "u8":
+			return e.WriteByte(byte(val))
+		case "u16":
+			return e.WriteUint16(uint16(val), order)
+		case "u32":
+			return e.WriteUint32(uint32(val), order)
+		case "u64":
+			return e.WriteUint64(val, order)
+		default:
+			return fmt.Errorf("unsupported prefix type: %s", typeName)
+		}
+
+	case "":
+		// root node for multiple modifiers
+		for _, child := range tagTree.Children {
+			if err := e.encodeWithTagTree(rv, child); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown tag modifier: %s", tagTree.Name)
+	}
+}
+
+// writeConstant 写入常量值
+func (e *Encoder) writeConstant(typeName string, value int) error {
+	switch typeName {
+	case "u64":
+		return e.WriteUint64(uint64(value), binary.LittleEndian)
+	case "u32":
+		return e.WriteUint32(uint32(value), binary.LittleEndian)
+	case "u16":
+		return e.WriteUint16(uint16(value), binary.LittleEndian)
+	case "u8":
+		return e.WriteByte(byte(value))
+	default:
+		return fmt.Errorf("unsupported constant type: %s", typeName)
+	}
+}
+
 func (e *Encoder) WriteBytes(b []byte, writeLength bool) error {
 	if traceEnabled {
 		zlog.Debug("encode: write byte array", zap.Int("len", len(b)))

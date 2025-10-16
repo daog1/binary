@@ -97,6 +97,256 @@ func (dec *Decoder) IsCompactU16() bool {
 	return dec.encoding.IsCompactU16()
 }
 
+// decodeWithTagTree 根据标签树进行解码
+func (dec *Decoder) decodeWithTagTree(rv reflect.Value, tagTree *TagNode) error {
+	if tagTree == nil {
+		return dec.Decode(rv.Addr().Interface())
+	}
+
+	switch tagTree.Name {
+	case "hidden_prefix":
+		constant := tagTree.FindChildByName("constant")
+		if constant != nil {
+			if err := dec.decodeWithTagTree(rv, constant); err != nil {
+				return fmt.Errorf("invalid constant prefix: %w", err)
+			}
+		}
+		fixed_size := tagTree.FindChildByName("fixed_size")
+		if fixed_size != nil {
+			return dec.decodeWithTagTree(rv, fixed_size)
+		}
+		return dec.Decode(rv.Addr().Interface())
+
+	case "constant":
+		if len(tagTree.Children) == 1 {
+			// Single value, default to u8
+			constValue := tagTree.Children[0].Value.(int)
+			return dec.readConstant("u8", constValue)
+		} else if len(tagTree.Children) == 2 {
+			constType := tagTree.Children[0].Value.(string)
+			constValue := tagTree.Children[1].Value.(int)
+			return dec.readConstant(constType, constValue)
+		}
+		return fmt.Errorf("invalid constant children")
+
+	case "pre_offset":
+		return dec.Decode(rv.Addr().Interface())
+
+	case "remainder_option":
+		// remainder_option<> - optional field that consumes remaining data
+		// Check if there's any data remaining
+		if dec.pos >= len(dec.data) {
+			// No data, set to nil
+			if rv.Kind() == reflect.Ptr {
+				rv.Set(reflect.Zero(rv.Type()))
+			}
+			return nil
+		}
+		// There is data, decode it
+		if rv.Kind() == reflect.Ptr {
+			elem := reflect.New(rv.Type().Elem())
+			err := dec.Decode(elem.Interface())
+			if err != nil {
+				return err
+			}
+			rv.Set(elem)
+		} else {
+			return dec.Decode(rv.Addr().Interface())
+		}
+		return nil
+
+	case "fixed_size":
+		// fixed_size<size> or fixed_size<type,size> - fixed size decoding
+		var size int
+		if len(tagTree.Children) == 1 {
+			size = tagTree.Children[0].Value.(int)
+		} else if len(tagTree.Children) == 2 {
+			size = tagTree.Children[1].Value.(int)
+		} else {
+			return fmt.Errorf("fixed_size expects 1 or 2 children, got %d", len(tagTree.Children))
+		}
+		if rv.Kind() != reflect.String {
+			return fmt.Errorf("fixed_size currently only supports string, got %v", rv.Kind())
+		}
+		bytes, err := dec.ReadNBytes(size)
+		if err != nil {
+			return err
+		}
+		// 移除尾部的零字节填充
+		str := string(bytes)
+		str = strings.TrimRight(str, "\x00")
+		rv.SetString(str)
+		return nil
+
+	case "size_prefix":
+		// size_prefix<prefix_type> - decode size using the specified prefix type
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("size_prefix expects 1 child, got %d", len(tagTree.Children))
+		}
+		if rv.Kind() != reflect.Slice {
+			return fmt.Errorf("size_prefix only supports slice, got %v", rv.Kind())
+		}
+		// Decode length using the prefix type
+		var length int
+		if err := dec.decodeWithTagTree(reflect.ValueOf(&length).Elem(), tagTree.Children[0]); err != nil {
+			return fmt.Errorf("failed to decode size prefix: %w", err)
+		}
+		// Create slice with the decoded length
+		elemType := rv.Type().Elem()
+		slice := reflect.MakeSlice(rv.Type(), length, length)
+		// Decode elements
+		for i := 0; i < length; i++ {
+			elemPtr := reflect.New(elemType)
+			if err := dec.Decode(elemPtr.Interface()); err != nil {
+				return err
+			}
+			slice.Index(i).Set(elemPtr.Elem())
+		}
+		rv.Set(slice)
+		return nil
+
+	case "fixed":
+		// fixed<...> - container for fixed decoding
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("fixed expects 1 child, got %d", len(tagTree.Children))
+		}
+		return dec.decodeWithTagTree(rv, tagTree.Children[0])
+
+	case "option":
+		// option<subtag> - decode as variant: 0 -> zero, 1 -> decode(value)
+		if len(tagTree.Children) != 1 {
+			return fmt.Errorf("option expects 1 child, got %d", len(tagTree.Children))
+		}
+		variant, err := dec.ReadByte()
+		if err != nil {
+			return err
+		}
+		if variant == 0 {
+			rv.SetZero()
+		} else if variant == 1 {
+			return dec.decodeWithTagTree(rv, tagTree.Children[0])
+		} else {
+			return fmt.Errorf("invalid option variant: %d", variant)
+		}
+		return nil
+
+	case "prefix":
+		// prefix<type,order> - decode value using specified type and byte order
+		if len(tagTree.Children) != 2 {
+			return fmt.Errorf("prefix expects 2 children, got %d", len(tagTree.Children))
+		}
+		typeName := tagTree.Children[0].Value.(string)
+		orderName := tagTree.Children[1].Value.(string)
+		var order binary.ByteOrder
+		if orderName == "le" {
+			order = binary.LittleEndian
+		} else if orderName == "be" {
+			order = binary.BigEndian
+		} else {
+			return fmt.Errorf("unknown byte order: %s", orderName)
+		}
+		// Decode as the specified type and set to rv
+		switch typeName {
+		case "u8":
+			val, err := dec.ReadByte()
+			if err != nil {
+				return err
+			}
+			if rv.Kind() == reflect.Int || rv.Kind() == reflect.Int8 || rv.Kind() == reflect.Int16 || rv.Kind() == reflect.Int32 || rv.Kind() == reflect.Int64 {
+				rv.SetInt(int64(val))
+			} else {
+				rv.SetUint(uint64(val))
+			}
+		case "u16":
+			val, err := dec.ReadUint16(order)
+			if err != nil {
+				return err
+			}
+			if rv.Kind() == reflect.Int || rv.Kind() == reflect.Int8 || rv.Kind() == reflect.Int16 || rv.Kind() == reflect.Int32 || rv.Kind() == reflect.Int64 {
+				rv.SetInt(int64(val))
+			} else {
+				rv.SetUint(uint64(val))
+			}
+		case "u32":
+			val, err := dec.ReadUint32(order)
+			if err != nil {
+				return err
+			}
+			if rv.Kind() == reflect.Int || rv.Kind() == reflect.Int8 || rv.Kind() == reflect.Int16 || rv.Kind() == reflect.Int32 || rv.Kind() == reflect.Int64 {
+				rv.SetInt(int64(val))
+			} else {
+				rv.SetUint(uint64(val))
+			}
+		case "u64":
+			val, err := dec.ReadUint64(order)
+			if err != nil {
+				return err
+			}
+			if rv.Kind() == reflect.Int || rv.Kind() == reflect.Int8 || rv.Kind() == reflect.Int16 || rv.Kind() == reflect.Int32 || rv.Kind() == reflect.Int64 {
+				rv.SetInt(int64(val))
+			} else {
+				rv.SetUint(val)
+			}
+		default:
+			return fmt.Errorf("unsupported prefix type: %s", typeName)
+		}
+		return nil
+
+	case "":
+		// root node for multiple modifiers
+		for _, child := range tagTree.Children {
+			if err := dec.decodeWithTagTree(rv, child); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown tag modifier: %s", tagTree.Name)
+	}
+}
+
+// readConstant 读取常量值并验证
+func (dec *Decoder) readConstant(typeName string, expectedValue int) error {
+	switch typeName {
+	case "u64":
+		val, err := dec.ReadUint64(binary.LittleEndian)
+		if err != nil {
+			return err
+		}
+		if int(val) != expectedValue {
+			return fmt.Errorf("constant value mismatch: expected %d, got %d", expectedValue, val)
+		}
+	case "u32":
+		val, err := dec.ReadUint32(binary.LittleEndian)
+		if err != nil {
+			return err
+		}
+		if int(val) != expectedValue {
+			return fmt.Errorf("constant value mismatch: expected %d, got %d", expectedValue, val)
+		}
+	case "u16":
+		val, err := dec.ReadUint16(binary.LittleEndian)
+		if err != nil {
+			return err
+		}
+		if int(val) != expectedValue {
+			return fmt.Errorf("constant value mismatch: expected %d, got %d", expectedValue, val)
+		}
+	case "u8":
+		val, err := dec.ReadByte()
+		if err != nil {
+			return err
+		}
+		if int(val) != expectedValue {
+			return fmt.Errorf("constant value mismatch: expected %d, got %d", expectedValue, val)
+		}
+	default:
+		return fmt.Errorf("unsupported constant type: %s", typeName)
+	}
+	return nil
+}
+
 func NewDecoderWithEncoding(data []byte, enc Encoding) *Decoder {
 	if !isValidEncoding(enc) {
 		panic(fmt.Sprintf("provided encoding is not valid: %s", enc))

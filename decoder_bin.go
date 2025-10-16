@@ -47,14 +47,24 @@ func (dec *Decoder) decodeBin(rv reflect.Value, opt *option) (err error) {
 	}
 	dec.currentFieldOpt = opt
 
-	unmarshaler, rv := indirect(rv, opt.is_Optional())
-
+	//unmarshaler, rv := indirect(rv, opt.is_Optional())
+	// For remainder_option tags, we need to preserve the pointer to allow setting it to nil
+	decodingNull := opt.is_Optional()
+	if opt.FieldTag != nil && opt.FieldTag.NestedTag != nil && opt.FieldTag.NestedTag.Name == "remainder_option" {
+		decodingNull = true
+	}
+	unmarshaler, rv := indirect(rv, decodingNull)
 	if traceEnabled {
 		zlog.Debug("decode: type",
 			zap.Stringer("value_kind", rv.Kind()),
 			zap.Bool("has_unmarshaler", (unmarshaler != nil)),
 			zap.Reflect("options", opt),
 		)
+	}
+
+	// Handle nested tags first
+	if opt.FieldTag != nil && opt.FieldTag.NestedTag != nil {
+		return dec.decodeWithTagTree(rv, opt.FieldTag.NestedTag)
 	}
 
 	if opt.is_Optional() {
@@ -318,6 +328,7 @@ func (dec *Decoder) decodeStructBin(rt reflect.Type, rv reflect.Value) (err erro
 		option := &option{
 			is_OptionalField: fieldTag.Option,
 			Order:            fieldTag.Order,
+			FieldTag:         fieldTag,
 		}
 
 		if s, ok := sizeOfMap[structField.Name]; ok {
